@@ -1,6 +1,7 @@
 // Copyright 2023-2024, Offchain Labs, Inc.
 // For licensing, see https://github.com/OffchainLabs/cargo-stylus/blob/main/licenses/COPYRIGHT.md
 
+use alloy::providers::{Provider, ProviderBuilder};
 use eyre::{Context, Result};
 use std::{
     ffi::OsStr,
@@ -36,4 +37,12 @@ pub fn file_or_stdout(path: Option<PathBuf>) -> Result<Box<dyn Write>> {
         Some(file) => Box::new(File::create(file)?),
         None => Box::new(io::stdout().lock()),
     })
+}
+
+/// Creates a new provider for the given endpoint.
+pub async fn new_provider(endpoint: &str) -> Result<impl Provider> {
+    ProviderBuilder::new()
+        .connect(endpoint)
+        .await
+        .wrap_err("failed to connect to provider")
 }

@@ -6,7 +6,7 @@
 
 use alloy::{
     primitives::{utils::parse_ether, Address, Bytes, TxHash, B256, U256},
-    providers::ProviderBuilder,
+    providers::{Provider, ProviderBuilder},
 };
 use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand};
 use constants::DEFAULT_ENDPOINT;
@@ -27,6 +27,15 @@ use std::{env, os::unix::process::CommandExt};
 // Conditional import for Windows
 #[cfg(windows)]
 use std::env;
+
+use std::process::Stdio;
+
+// ethers types are replaced by alloy types imported above
+type H160 = Address;
+type H256 = B256;
+
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 mod activate;
 mod cache;
@@ -118,6 +127,9 @@ enum Apis {
     /// Replay a transaction in gdb.
     #[command(visible_alias = "r")]
     Replay(ReplayArgs),
+    /// Trace a transaction with walnut-dbg, capturing user function calls.
+    #[command(visible_alias = "uf")]
+    Usertrace(UsertraceArgs),
     /// Trace a transaction.
     #[command(visible_alias = "t")]
     Trace(TraceArgs),
@@ -329,6 +341,24 @@ struct ReplayArgs {
 }
 
 #[derive(Args, Clone, Debug)]
+struct UsertraceArgs {
+    #[command(flatten)]
+    trace: TraceArgs,
+    /// Whether to use stable Rust. Note that nightly is needed to expand macros.
+    #[arg(short, long)]
+    stable_rust: bool,
+    /// Any features that should be passed to cargo build.
+    #[arg(short, long)]
+    features: Option<Vec<String>>,
+    /// Which specific package to build during replay, if any.
+    #[arg(long)]
+    package: Option<String>,
+    /// Whether this process is the child of another.
+    #[arg(short, long, hide(true))]
+    child: bool,
+}
+
+#[derive(Args, Clone, Debug)]
 struct TraceArgs {
     /// RPC endpoint.
     #[arg(short, long, default_value = "http://localhost:8547")]
@@ -342,6 +372,28 @@ struct TraceArgs {
     /// If set, use the native tracer instead of the JavaScript one. Notice the native tracer might not be available in the node.
     #[arg(short, long, default_value_t = false)]
     use_native_tracer: bool,
+    /// If set, capture calls from `stylus_sdk::` and external calls as well.
+    #[arg(long, default_value_t = false)]
+    verbose_usertrace: bool,
+    /// Comma-separated list of other crates to trace. Example: --trace-external-usertrace="std,core,other_contract"
+    #[arg(
+        long,
+        use_value_delimiter = true,
+        value_delimiter = ','
+    )]
+    trace_external_usertrace: Vec<String>,
+    /// If passed, do NOT redirect walnut-dbg's output to `/dev/null`.
+    /// By default, we silence walnut-dbg to keep console output clean.
+    #[arg(long, default_value_t = false)]
+    enable_walnutdbg_output: bool,
+
+    /// Solidity contract address for EVM-level callTracer.
+    #[arg(
+        long,
+        value_name = "ADDRESS",
+        value_parser = clap::value_parser!(H160)
+    )]
+    addr_solidity: Option<H160>,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -407,6 +459,47 @@ struct AuthOpts {
     keystore_password_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct DebugTraceResult {
+    #[serde(rename = "calls")]
+    calls: Vec<DebugTraceCall>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DebugTraceCall {
+    from: H160,
+    to: H160,
+    input: String,
+    #[serde(default)]
+    calls: Vec<DebugTraceCall>,
+}
+
+impl fmt::Display for CommonConfig {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // Convert the vector of source files to a comma-separated string
+        let mut source_files: String = "".to_string();
+        if !self.source_files_for_project_hash.is_empty() {
+            source_files = format!(
+                "--source-files-for-project-hash={}",
+                self.source_files_for_project_hash.join(", ")
+            );
+        }
+        write!(
+            f,
+            "--endpoint={} {} {} {}",
+            self.endpoint,
+            match self.verbose {
+                true => "--verbose",
+                false => "",
+            },
+            source_files,
+            match &self.max_fee_per_gas_gwei {
+                Some(fee) => format!("--max-fee-per-gas-gwei {}", fee),
+                None => "".to_string(),
+            }
+        )
+    }
+}
 pub trait GasFeeConfig {
     fn get_max_fee_per_gas_wei(&self) -> Result<Option<u128>>;
     fn get_fee_str(&self) -> &Option<String>;
@@ -679,6 +772,7 @@ async fn main_impl(args: Opts) -> Result<()> {
         }
         Apis::Trace(args) => run!(trace(args).await, "failed to trace tx"),
         Apis::Replay(args) => run!(replay(args).await, "failed to replay tx"),
+        Apis::Usertrace(args) => run!(usertrace(args).await, "failed to usertrace tx"),
         Apis::Cache(subcommand) => match subcommand {
             Cache::Bid(config) => {
                 run!(
@@ -768,6 +862,136 @@ async fn simulate(args: SimulateArgs) -> Result<()> {
     Ok(())
 }
 
+fn derive_crate_name(shared_library: &Path) -> String {
+    let stem = shared_library
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+
+    let crate_name = stem.strip_prefix("lib").unwrap_or(&stem);
+    crate_name.to_string()
+}
+
+async fn usertrace(args: UsertraceArgs) -> eyre::Result<()> {
+    let macos = cfg!(target_os = "macos");
+    build_shared_library(&args.trace.project, args.package, args.features)?;
+    let library_extension = if macos { ".dylib" } else { ".so" };
+    let shared_library = find_shared_library(&args.trace.project, library_extension)?;
+    let crate_name = derive_crate_name(&shared_library);
+
+    // Get the receipt & print the to-address.
+    let provider = sys::new_provider(&args.trace.endpoint).await?;
+    let eth_tx_hash = H256::from_slice(args.trace.tx.as_ref());
+    if let Some(receipt) = provider.get_transaction_receipt(eth_tx_hash).await? {
+        if let Some(to_addr) = receipt.to {
+            println!("Tracing contract at address: \x1b[1;32m{:?}\x1b[0m", to_addr);
+        } else {
+            eprintln!("Warning: tx {} has no “to” address", args.trace.tx);
+        }
+    } else {
+        eprintln!("Warning: no receipt found for tx {}", args.trace.tx);
+    }
+
+    // If the user supplied --addr-solidity, pull the EVM callTracer tree
+    if let Some(sol_addr) = args.trace.addr_solidity {
+        let raw = json!([
+            args.trace.tx,
+            { "tracer": "callTracer", "to": sol_addr }
+        ]);
+        let dbg: DebugTraceResult = provider
+            .raw_request::<serde_json::Value, DebugTraceResult>(
+                std::borrow::Cow::Borrowed("debug_traceTransaction"),
+                raw,
+            )
+            .await
+            .wrap_err("debug_traceTransaction failed")?;
+
+        let _ = std::fs::remove_file("/tmp/sol_trace.json");
+        // Write out the solidity tracer JSON for the pretty-printer.
+        std::fs::write(
+            "/tmp/sol_trace.json",
+            serde_json::to_string_pretty(&dbg)?,
+        )?;
+    }
+
+    // Build the walnut-dbg calltrace command.
+    let mut crates_to_trace = vec![crate_name];
+    if args.trace.verbose_usertrace {
+        crates_to_trace.push("stylus_sdk".to_string());
+    }
+    crates_to_trace.extend(args.trace.trace_external_usertrace.clone());
+    let pattern = format!("^({})::", crates_to_trace.join("|"));
+    let calltrace_cmd = format!("calltrace start '{}'", pattern);
+
+    // Non-child: spawn walnut-dbg + pretty-print.
+    if !args.child {
+        // Remove any stale LLDB trace.
+        let _ = std::fs::remove_file("/tmp/lldb_function_trace.json");
+
+        // invoke walnut-dbg
+        let (cmd_name, cmd_args) = if sys::command_exists("rust-walnut-dbg") {
+            ("rust-walnut-dbg", &[
+                "-o", "b user_entrypoint",
+                "-o", "r",
+                "-o", &calltrace_cmd,
+                "-o", "c",
+                "-o", "calltrace stop",
+                "-o", "q",
+                "--",
+            ][..])
+        } else {
+            bail!("rust-walnut-dbg not installed");
+        };
+        let mut dbg_cmd = sys::new_command(cmd_name);
+        dbg_cmd.args(cmd_args);
+        // Forward all original args and append child flag.
+        for a in std::env::args() {
+            dbg_cmd.arg(a);
+        }
+        dbg_cmd.arg("--child");
+        if !args.trace.enable_walnutdbg_output {
+            dbg_cmd.stdin(Stdio::null())
+                   .stdout(Stdio::null())
+                   .stderr(Stdio::null());
+        }
+        let status = dbg_cmd.status()?;
+        if !status.success() {
+            bail!("walnut-dbg returned {}", status);
+        }
+
+        // Now pretty-print both trees.
+        let mut pp = sys::new_command("pretty-print-trace");
+        pp.arg("/tmp/lldb_function_trace.json");
+        // Only pass solidity file if we generated it.
+        if args.trace.addr_solidity.is_some() {
+            pp.arg("/tmp/sol_trace.json");
+        }
+        let mut child = pp.spawn()?;
+        let _ = child.wait();
+
+        return Ok(());
+    }
+
+    // Replay the WASM.
+    let provider = sys::new_provider(&args.trace.endpoint).await?;
+    let trace = Trace::new(&provider, args.trace.tx, args.trace.use_native_tracer).await?;
+    let args_len = trace.tx.input.input.as_ref().map(|i| i.len()).unwrap_or(0);
+
+    unsafe {
+        *hostio::FRAME.lock() = Some(trace.reader());
+        type Entrypoint = unsafe extern "C" fn(usize) -> usize;
+        let lib = libloading::Library::new(shared_library)?;
+        let main: libloading::Symbol<Entrypoint> = lib.get(b"user_entrypoint")?;
+        match main(args_len) {
+            0 => println!("call completed successfully"),
+            1 => println!("call reverted"),
+            x => println!("call exited with unknown status code: {}", x.red()),
+        }
+    }
+
+    Ok(())
+}
+
 async fn replay(args: ReplayArgs) -> Result<()> {
     let macos = cfg!(target_os = "macos");
     if !args.child {
@@ -828,7 +1052,7 @@ async fn replay(args: ReplayArgs) -> Result<()> {
     let shared_library = find_shared_library(&args.trace.project, library_extension)?;
 
     // TODO: don't assume the contract is top-level
-    let Some(args) = trace.tx.input.input() else {
+    let Some(args) = &trace.tx.input.input else {
         bail!("missing transaction input");
     };
     let args_len = args.len();
