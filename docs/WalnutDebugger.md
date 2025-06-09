@@ -119,7 +119,7 @@ $ source ./myvenv/bin/activate
 We have introduced a new `cargo` option called `usertrace`, that uses similar technology as `replay` option, but it rather attaches to `walnut-dbg`, instead of well known debuggers.
 
 ``` bash
-$ cargo walnutdbg usertrace \
+$ cargo stylus usertrace \
   --tx=0x88b0ad9daa0b701d868a5f9a0132db7c0402178ba44ed8dec4ba76784c7194fd \
   --endpoint=$RPC_URL
 === WALNUT FUNCTION CALL TREE ===
@@ -146,7 +146,7 @@ You may see the calltrace in form of JSON in:
 By default, it does not follow functions from `stylus_sdk::`, if you want to see those, use `--verbose-usertrace` option, e.g.:
 
 ```bash
-$ cargo walnutdbg usertrace \
+$ cargo stylus usertrace \
   --tx=0x88b0ad9daa0b701d868a5f9a0132db7c0402178ba44ed8dec4ba76784c7194fd \
   --endpoint=$RPC_URL --verbose-usertrace
 ```
@@ -154,7 +154,7 @@ $ cargo walnutdbg usertrace \
 Or, if you want to track calls from other libraries, just use `--trace-external-usertrace` as follows:
 
 ```bash
-cargo walnutdbg usertrace \
+cargo stylus usertrace \
   --tx=0x88b0ad9daa0b701d868a5f9a0132db7c0402178ba44ed8dec4ba76784c7194fd \
   --endpoint=$RPC_URL --verbose-usertrace --trace-external-usertrace="std,core,other_contract"
 ```
