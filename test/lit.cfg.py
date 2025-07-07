@@ -86,8 +86,8 @@ if check_debugger('gdb'):
     config.available_features.add('gdb')
 if check_debugger('lldb'):
     config.available_features.add('lldb')
-if check_debugger('walnut-dbg'):
-    config.available_features.add('walnut-dbg')
+if check_debugger('stylusdb'):
+    config.available_features.add('stylusdb')
 
 # Add 'not' command
 not_path = shutil.which('not')

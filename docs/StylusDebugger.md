@@ -1,10 +1,10 @@
-# Walnut Debugger
+# Stylus Debugger
 
-This file explains walnut debugging capabilities via `walnut-dbg`.
+This file explains stylus debugging capabilities via `stylusdb`.
 
 ## How to build it?
 
-To use this, you need to install `walnut-dbg` tool from [walnut-dbg](https://github.com/walnuthq/walnut-dbg).
+To use this, you need to install `stylusdb` tool from [stylusdb](https://github.com/walnuthq/stylusdb).
 
 Second, install this `cargo` tool (NOTE: This will be merged into original `cargo-stylus`).
 
@@ -106,7 +106,7 @@ Process 9256 exited with status = 0 (0x00000000)
 
 ### Run `usertrace` command
 
-We have introduced a new `cargo` option called `usertrace`, that uses similar technology as `replay` option, but it rather attaches to `walnut-dbg`, instead of well known debuggers.
+We have introduced a new `cargo` option called `usertrace`, that uses similar technology as `replay` option, but it rather attaches to `stylusdb`, instead of well known debuggers.
 
 First, make sure you installed `colorama` package:
 
@@ -116,13 +116,13 @@ $ source ./myvenv/bin/activate
 (myvenv) $ pip3 install colorama
 ```
 
-We have introduced a new `cargo` option called `usertrace`, that uses similar technology as `replay` option, but it rather attaches to `walnut-dbg`, instead of well known debuggers.
+We have introduced a new `cargo` option called `usertrace`, that uses similar technology as `replay` option, but it rather attaches to `stylusdb`, instead of well known debuggers.
 
 ``` bash
 $ cargo stylus usertrace \
   --tx=0x88b0ad9daa0b701d868a5f9a0132db7c0402178ba44ed8dec4ba76784c7194fd \
   --endpoint=$RPC_URL
-=== WALNUT FUNCTION CALL TREE ===
+=== STYLUS FUNCTION CALL TREE ===
 └─ #1 stylus_hello_world::__stylus_struct_entrypoint::h09ecd85e5c55b994 (lib.rs:33)
     input = size=4
     <anon> = stylus_sdk::host::VM { 0=<unavailable> }
@@ -161,22 +161,22 @@ cargo stylus usertrace \
 
 and it will track calls from `std::`, `core` and `other_contract::`.
 
-### Run `replay` option with `walnut-dbg`
+### Run `replay` option with `stylusdb`
 
-To use `walnut-dbg`, specify `--debugger walnut-dbg`.
+To use `stylusdb`, specify `--debugger stylusdb`.
 
 ```bash
-$ cargo stylus replay --debugger walnut-dbg --tx <TX_HASH> [other args]
+$ cargo stylus replay --debugger stylusdb --tx <TX_HASH> [other args]
 ```
 
 If you want to debug multi-contract transaction, use:
 
 ```bash
-$ cargo stylus replay --debugger walnut-dbg --tx <TX_HASH> \
+$ cargo stylus replay --debugger stylusdb --tx <TX_HASH> \
   --contracts ADDR:PATH,0xe1080224B632A93951A7CFA33EeEa9Fd81558b5e:../ \
   --endpoint=$RPC_URL
 ...
-(walnut-dbg) walnut-contract breakpoint 0xe1080224B632A93951A7CFA33EeEa9Fd81558b5e external_contract::ServiceContract::increment
+(stylusdb) stylus-contract breakpoint 0xe1080224B632A93951A7CFA33EeEa9Fd81558b5e external_contract::ServiceContract::increment
 Set breakpoint on external_contract::ServiceContract::increment in contract 0xe1080224B632A93951A7CFA33EeEa9Fd81558b5e (ID: 3, 1 locations)
 ...
 ```
@@ -186,7 +186,7 @@ Set breakpoint on external_contract::ServiceContract::increment in contract 0xe1
 When debugging transactions that involve calls from Stylus to Solidity contracts, you can use the `--addr-solidity` flag to mark specific addresses as Solidity contracts:
 
 ```bash
-$ cargo stylus replay --debugger walnut-dbg --tx <TX_HASH> \
+$ cargo stylus replay --debugger stylusdb --tx <TX_HASH> \
   --addr-solidity=0xda52b25ddb0e3b9cc393b0690ac62245ac772527 \
   --endpoint=$RPC_URL
 ```

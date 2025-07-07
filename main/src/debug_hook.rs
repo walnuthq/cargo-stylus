@@ -30,15 +30,15 @@ impl DebuggerHook for NoOpDebuggerHook {
     fn on_contract_info(&self, _contract_address: &str, _is_solidity: bool) {}
 }
 
-/// Walnut debugger hook that communicates via Unix socket
-pub struct WalnutDebuggerHook {
+/// Stylus debugger hook that communicates via Unix socket
+pub struct StylusDebuggerHook {
     socket_path: String,
     connection: Arc<Mutex<Option<UnixStream>>>,
 }
 
-impl WalnutDebuggerHook {
+impl StylusDebuggerHook {
     pub fn new() -> Result<Self> {
-        let socket_path = format!("/tmp/walnut_debug_{}.sock", std::process::id());
+        let socket_path = format!("/tmp/stylus_debug_{}.sock", std::process::id());
 
         // Start listener in background
         let path_clone = socket_path.clone();
@@ -82,7 +82,7 @@ impl WalnutDebuggerHook {
     }
 }
 
-impl DebuggerHook for WalnutDebuggerHook {
+impl DebuggerHook for StylusDebuggerHook {
     fn on_external_call(&self, contract_address: &str, _frame: &TraceFrame) {
         self.send_command(&format!("switch_context {}", contract_address));
     }
@@ -104,7 +104,7 @@ impl DebuggerHook for WalnutDebuggerHook {
     }
 }
 
-impl Drop for WalnutDebuggerHook {
+impl Drop for StylusDebuggerHook {
     fn drop(&mut self) {
         // Clean up socket file
         let _ = std::fs::remove_file(&self.socket_path);

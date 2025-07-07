@@ -13,7 +13,7 @@ This directory contains the LLVM lit-based test suite for the `cargo-stylus` rep
      --dev --http.addr 0.0.0.0 --http.api=net,web3,eth,arb,arbdebug,debug
    ```
 4. **FileCheck**: Part of LLVM tools (usually available with LLVM installation)
-5. **walnut-dbg** (optional): For full replay/usertrace testing
+5. **stylusdb** (optional): For full replay/usertrace testing
 6. **cargo-stylus**: Install with `cargo install cargo-stylus` or build from this project
 
 ## Running Tests

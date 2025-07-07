@@ -8,4 +8,4 @@
 
 # LLDB: Current executable set to
 
-# AUTO: {{(Current executable set to|\(walnut-dbg\)|GNU gdb)}}
+# AUTO: {{(Current executable set to|\(stylusdb\)|GNU gdb)}}

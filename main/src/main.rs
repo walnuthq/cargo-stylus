@@ -130,10 +130,10 @@ enum Apis {
     Verify(VerifyConfig),
     /// Generate c code bindings for a Stylus contract.
     Cgen { input: PathBuf, out_dir: PathBuf },
-    /// Replay a transaction in gdb, lldb, or walnut-dbg.
+    /// Replay a transaction in gdb, lldb, or stylusdb.
     #[command(visible_alias = "r")]
     Replay(ReplayArgs),
-    /// Trace a transaction with walnut-dbg, capturing user function calls.
+    /// Trace a transaction with stylusdb, capturing user function calls.
     #[command(visible_alias = "uf")]
     Usertrace(UsertraceArgs),
     /// Trace a transaction.
@@ -344,7 +344,7 @@ struct ReplayArgs {
     /// Whether this process is the child of another.
     #[arg(short, long, hide(true))]
     child: bool,
-    /// Which debugger to use: gdb, lldb, walnut-dbg, or auto (auto-detect).
+    /// Which debugger to use: gdb, lldb, stylusdb, or auto (auto-detect).
     #[arg(long, value_name = "DEBUGGER", default_value = "auto")]
     debugger: String,
     /// Contract addresses and their source paths for multi-contract debugging.
@@ -401,10 +401,10 @@ struct TraceArgs {
         value_delimiter = ','
     )]
     trace_external_usertrace: Vec<String>,
-    /// If passed, do NOT redirect walnut-dbg's output to `/dev/null`.
-    /// By default, we silence walnut-dbg to keep console output clean.
+    /// If passed, do NOT redirect stylusdb's output to `/dev/null`.
+    /// By default, we silence stylusdb to keep console output clean.
     #[arg(long, default_value_t = false)]
-    enable_walnutdbg_output: bool,
+    enable_stylusdb_output: bool,
 
     /// Solidity contract addresses. These contracts will be recognized as Solidity
     /// contracts and displayed accordingly during debugging.
@@ -1201,7 +1201,7 @@ async fn usertrace(args: UsertraceArgs) -> eyre::Result<()> {
         }
     }
 
-    // Build the walnut-dbg calltrace command.
+    // Build the stylusdb calltrace command.
     let mut crates_to_trace = vec![crate_name];
     if args.trace.verbose_usertrace {
         crates_to_trace.push("stylus_sdk".to_string());
@@ -1210,14 +1210,14 @@ async fn usertrace(args: UsertraceArgs) -> eyre::Result<()> {
     let pattern = format!("^({})::", crates_to_trace.join("|"));
     let calltrace_cmd = format!("calltrace start '{}'", pattern);
 
-    // Non-child: spawn walnut-dbg + pretty-print.
+    // Non-child: spawn stylusdb + pretty-print.
     if !args.child {
         // Remove any stale LLDB trace.
         let _ = std::fs::remove_file("/tmp/lldb_function_trace.json");
 
-        // invoke walnut-dbg
-        let (cmd_name, cmd_args) = if sys::command_exists("rust-walnut-dbg") {
-            ("rust-walnut-dbg", &[
+        // invoke stylusdb
+        let (cmd_name, cmd_args) = if sys::command_exists("rust-stylusdb") {
+            ("rust-stylusdb", &[
                 "-o", "b user_entrypoint",
                 "-o", "r",
                 "-o", &calltrace_cmd,
@@ -1227,7 +1227,7 @@ async fn usertrace(args: UsertraceArgs) -> eyre::Result<()> {
                 "--",
             ][..])
         } else {
-            bail!("rust-walnut-dbg not installed");
+            bail!("rust-stylusdb not installed");
         };
         let mut dbg_cmd = sys::new_command(cmd_name);
         dbg_cmd.args(cmd_args);
@@ -1236,14 +1236,14 @@ async fn usertrace(args: UsertraceArgs) -> eyre::Result<()> {
             dbg_cmd.arg(a);
         }
         dbg_cmd.arg("--child");
-        if !args.trace.enable_walnutdbg_output {
+        if !args.trace.enable_stylusdb_output {
             dbg_cmd.stdin(Stdio::null())
                    .stdout(Stdio::null())
                    .stderr(Stdio::null());
         }
         let status = dbg_cmd.status()?;
         if !status.success() {
-            bail!("walnut-dbg returned {}", status);
+            bail!("stylusdb returned {}", status);
         }
 
         // Now pretty-print both trees.
@@ -1295,12 +1295,12 @@ async fn replay(args: ReplayArgs) -> Result<()> {
             "-ex=set breakpoint pending on".to_string(),
         ];
         let mut lldb_commands = vec!["--source-quietly".to_string()];
-        let mut walnut_commands = vec![];
+        let mut stylus_commands = vec![];
 
-        // For walnut-dbg, use the new walnut-contract commands
+        // For stylusdb, use the new stylus-contract commands
         for (addr, path) in registry.get_all_debug_info() {
-            walnut_commands.push("-o".to_string());
-            walnut_commands.push(format!("walnut-contract add {} {}", addr, path.display()));
+            stylus_commands.push("-o".to_string());
+            stylus_commands.push(format!("stylus-contract add {} {}", addr, path.display()));
         }
 
         // Set breakpoints on all user_entrypoints
@@ -1309,13 +1309,13 @@ async fn replay(args: ReplayArgs) -> Result<()> {
             gdb_commands.push("-ex=b user_entrypoint".to_string());
             lldb_commands.push("-o".to_string());
             lldb_commands.push("b user_entrypoint".to_string());
-            walnut_commands.push("-o".to_string());
-            walnut_commands.push("b user_entrypoint".to_string());
+            stylus_commands.push("-o".to_string());
+            stylus_commands.push("b user_entrypoint".to_string());
         } else {
-            // Multi-contract mode - set breakpoints for all contracts using walnut-contract
+            // Multi-contract mode - set breakpoints for all contracts using stylus-contract
             for addr in registry.contracts.keys() {
-                walnut_commands.push("-o".to_string());
-                walnut_commands.push(format!("walnut-contract breakpoint {} user_entrypoint", addr));
+                stylus_commands.push("-o".to_string());
+                stylus_commands.push(format!("stylus-contract breakpoint {} user_entrypoint", addr));
             }
             // Still set a general breakpoint for compatibility with GDB/LLDB
             gdb_commands.push("-ex=b user_entrypoint".to_string());
@@ -1329,13 +1329,13 @@ async fn replay(args: ReplayArgs) -> Result<()> {
         lldb_commands.push("-o".to_string());
         lldb_commands.push("r".to_string());
         lldb_commands.push("--".to_string());
-        walnut_commands.push("-o".to_string());
-        walnut_commands.push("r".to_string());
-        walnut_commands.push("--".to_string());
+        stylus_commands.push("-o".to_string());
+        stylus_commands.push("r".to_string());
+        stylus_commands.push("--".to_string());
 
         let gdb_args: Vec<&str> = gdb_commands.iter().map(|s| s.as_str()).collect();
         let lldb_args: Vec<&str> = lldb_commands.iter().map(|s| s.as_str()).collect();
-        let walnut_args: Vec<&str> = walnut_commands.iter().map(|s| s.as_str()).collect();
+        let stylus_args: Vec<&str> = stylus_commands.iter().map(|s| s.as_str()).collect();
 
         let (cmd_name, args) = match args.debugger.as_str() {
             "gdb" => {
@@ -1356,11 +1356,11 @@ async fn replay(args: ReplayArgs) -> Result<()> {
                     bail!("lldb not found")
                 }
             }
-            "walnut-dbg" => {
-                if sys::command_exists("rust-walnut-dbg") {
-                    ("rust-walnut-dbg", walnut_args.as_slice())
+            "stylusdb" => {
+                if sys::command_exists("rust-stylusdb") {
+                    ("rust-stylusdb", stylus_args.as_slice())
                 } else {
-                    bail!("rust-walnut-dbg not found")
+                    bail!("rust-stylusdb not found")
                 }
             }
             "auto" => {
@@ -1369,8 +1369,8 @@ async fn replay(args: ReplayArgs) -> Result<()> {
                     ("rust-gdb", gdb_args.as_slice())
                 } else if sys::command_exists("rust-lldb") {
                     ("rust-lldb", lldb_args.as_slice())
-                } else if sys::command_exists("rust-walnut-dbg") {
-                    ("rust-walnut-dbg", walnut_args.as_slice())
+                } else if sys::command_exists("rust-stylusdb") {
+                    ("rust-stylusdb", stylus_args.as_slice())
                 } else {
                     println!("rust specific debugger not installed, falling back to generic debugger");
                     if sys::command_exists("gdb") && !macos {
@@ -1382,7 +1382,7 @@ async fn replay(args: ReplayArgs) -> Result<()> {
                     }
                 }
             }
-            _ => bail!("Unknown debugger: {}. Supported debuggers: gdb, lldb, walnut-dbg, auto", args.debugger)
+            _ => bail!("Unknown debugger: {}. Supported debuggers: gdb, lldb, stylusdb, auto", args.debugger)
         };
 
         let mut cmd = sys::new_command(cmd_name);
@@ -1481,9 +1481,9 @@ async fn replay(args: ReplayArgs) -> Result<()> {
     // Get the top-level contract address before consuming trace
     let top_level_address = trace.top_frame.address().unwrap_or_default();
 
-    // Initialize debugger hook if using walnut-dbg
-    if args.debugger == "walnut-dbg" && !registry.contracts.is_empty() {
-        let hook = debug_hook::WalnutDebuggerHook::new()?;
+    // Initialize debugger hook if using stylusdb
+    if args.debugger == "stylusdb" && !registry.contracts.is_empty() {
+        let hook = debug_hook::StylusDebuggerHook::new()?;
 
         // Send all contract info to debugger
         let contracts: Vec<(String, String)> = registry.get_all_debug_info()

@@ -1,7 +1,7 @@
 # Test multi-contract replay functionality
-# REQUIRES: walnut-dbg
-# RUN: %cargo-stylus replay --tx %{caller_tx} --endpoint %{rpc_url} --contracts %{counter_address}:%{contracts}/counter,%{caller_address}:%{contracts}/caller --debugger walnut-dbg 2>&1 | FileCheck %s
+# REQUIRES: stylusdb
+# RUN: %cargo-stylus replay --tx %{caller_tx} --endpoint %{rpc_url} --contracts %{counter_address}:%{contracts}/counter,%{caller_address}:%{contracts}/caller --debugger stylusdb 2>&1 | FileCheck %s
 
 # CHECK: Building Stylus contract at
 # CHECK: from {{.*}}counter
-# CHECK: {{(walnut-dbg|Compiling|Blocking waiting for file lock)}}
+# CHECK: {{(stylusdb|Compiling|Blocking waiting for file lock)}}
