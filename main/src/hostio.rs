@@ -4,18 +4,82 @@
 #![allow(unused)]
 
 use super::trace::{FrameReader, HostioKind::*};
+use crate::debug_hook::get_debugger_hook;
 use function_name::named;
 use lazy_static::lazy_static;
 use parking_lot::Mutex;
 use std::{
     mem::{self, MaybeUninit},
     ptr::copy_nonoverlapping as memcpy,
+    sync::Arc,
 };
+use alloy::primitives::{Address, B256, U256};
+use std::collections::VecDeque;
+
+// Trait for accessing external contract libraries during debugging
+pub trait ExternalContractAccess: Send + Sync {
+    unsafe fn call_external_contract(&self, address: &Address, input_data: &[u8]) -> Result<(u8, Vec<u8>), Box<dyn std::error::Error>>;
+}
+
+// Structure to save execution state
+#[derive(Clone)]
+pub struct ExecutionState {
+    start_ink: u64,
+    end_ink: u64,
+}
 
 lazy_static! {
     pub static ref FRAME: Mutex<Option<FrameReader>> = Mutex::new(None);
     pub static ref START_INK: Mutex<u64> = Mutex::new(0);
     pub static ref END_INK: Mutex<u64> = Mutex::new(0);
+    pub static ref EXTERNAL_CONTRACT_ACCESS: Mutex<Option<Arc<dyn ExternalContractAccess>>> = Mutex::new(None);
+    pub static ref IN_EXTERNAL_CONTRACT: Mutex<bool> = Mutex::new(false);
+    pub static ref EXTERNAL_CONTRACT_INPUT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    pub static ref SAVED_STATE: Mutex<Option<ExecutionState>> = Mutex::new(None);
+}
+
+/// Set the external contract access for debugging
+pub fn set_external_contract_access(access: Arc<dyn ExternalContractAccess>) {
+    let mut guard = EXTERNAL_CONTRACT_ACCESS.lock();
+    *guard = Some(access);
+}
+
+/// Mark that we're entering an external contract
+pub fn enter_external_contract() {
+    // Save current state
+    let state = ExecutionState {
+        start_ink: *START_INK.lock(),
+        end_ink: *END_INK.lock(),
+    };
+    *SAVED_STATE.lock() = Some(state);
+
+    // Mark as in external contract
+    let mut guard = IN_EXTERNAL_CONTRACT.lock();
+    *guard = true;
+}
+
+/// Mark that we're exiting an external contract
+pub fn exit_external_contract() {
+    // Restore saved state
+    if let Some(state) = SAVED_STATE.lock().take() {
+        *START_INK.lock() = state.start_ink;
+        *END_INK.lock() = state.end_ink;
+    }
+
+    // Mark as no longer in external contract
+    let mut guard = IN_EXTERNAL_CONTRACT.lock();
+    *guard = false;
+}
+
+/// Set the input data for external contract execution
+pub fn set_external_contract_input(input: Vec<u8>) {
+    let mut guard = EXTERNAL_CONTRACT_INPUT.lock();
+    *guard = input;
+}
+
+/// Check if we're currently in an external contract
+pub fn is_in_external_contract() -> bool {
+    *IN_EXTERNAL_CONTRACT.lock()
 }
 
 macro_rules! frame {
@@ -44,6 +108,15 @@ macro_rules! copy {
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn read_args(dest: *mut u8) {
+    // If we're inside an external contract, provide the actual input data
+    if is_in_external_contract() {
+        let input_data = EXTERNAL_CONTRACT_INPUT.lock();
+        if !input_data.is_empty() {
+            copy!(input_data, dest, input_data.len());
+        }
+        return;
+    }
+
     frame!(ReadArgs { args });
     copy!(args, dest, args.len());
 }
@@ -57,6 +130,13 @@ static READ_ARGS: unsafe extern "C" fn(dest: *mut u8) = read_args;
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn write_result(data: *const u8, len: u32) {
+    // If we're inside an external contract, just ignore result writes
+    if is_in_external_contract() {
+        // For external contracts, we don't need to validate write_result
+        // The return data will be handled by the call_external_contract mechanism
+        return;
+    }
+
     frame!(WriteResult { result });
     assert_eq!(read_bytes(data, len), &*result);
 }
@@ -91,6 +171,15 @@ static EXIT_EARLY: unsafe extern "C" fn(status: u32) = exit_early;
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn storage_load_bytes32(key_ptr: *const u8, dest: *mut u8) {
+    // If we're inside an external contract, provide default storage behavior
+    if is_in_external_contract() {
+        // For external contracts, we just return zero values
+        // This allows the contract to execute without panicking on storage access
+        let zero_value = B256::ZERO;
+        copy!(zero_value, dest);
+        return;
+    }
+
     frame!(StorageLoadBytes32 { key, value });
     assert_eq!(read_fixed(key_ptr), key);
     copy!(value, dest);
@@ -114,6 +203,13 @@ static STORAGE_LOAD_BYTES32: unsafe extern "C" fn(key_ptr: *const u8, dest: *mut
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn storage_cache_bytes32(key_ptr: *const u8, value_ptr: *const u8) {
+    // If we're inside an external contract, just ignore storage writes
+    if is_in_external_contract() {
+        // For external contracts, we don't need to validate or cache storage writes
+        // This allows the contract to execute without panicking
+        return;
+    }
+
     frame!(StorageCacheBytes32 { key, value });
     assert_eq!(read_fixed(key_ptr), key);
     assert_eq!(read_fixed(value_ptr), value);
@@ -130,6 +226,13 @@ static STORAGE_CACHE_BYTES32: unsafe extern "C" fn(key_ptr: *const u8, value_ptr
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn storage_flush_cache(clear: u32) {
+    // If we're inside an external contract, just ignore flush operations
+    if is_in_external_contract() {
+        // For external contracts, we don't need to flush storage cache
+        // This allows the contract to execute without panicking
+        return;
+    }
+
     frame!(StorageFlushCache { clear });
 }
 
@@ -145,6 +248,14 @@ static STORAGE_FLUSH_CACHE: unsafe extern "C" fn(clear: u32) = storage_flush_cac
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn transient_load_bytes32(key_ptr: *const u8, dest: *mut u8) {
+    // If we're inside an external contract, provide default transient storage behavior
+    if is_in_external_contract() {
+        // For external contracts, return zero values for transient storage
+        let zero_value = B256::ZERO;
+        copy!(zero_value, dest);
+        return;
+    }
+
     frame!(TransientLoadBytes32 { key, value });
     assert_eq!(read_fixed(key_ptr), key);
     copy!(value, dest);
@@ -163,6 +274,12 @@ static TRANSIENT_LOAD_BYTES32: unsafe extern "C" fn(key_ptr: *const u8, dest: *m
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn transient_store_bytes32(key_ptr: *const u8, value_ptr: *const u8) {
+    // If we're inside an external contract, just ignore transient storage writes
+    if is_in_external_contract() {
+        // For external contracts, we don't need to validate or store transient values
+        return;
+    }
+
     frame!(TransientStoreBytes32 { key, value });
     assert_eq!(read_fixed(key_ptr), key);
     assert_eq!(read_fixed(value_ptr), value);
@@ -308,6 +425,11 @@ static BLOCK_GAS_LIMIT: unsafe extern "C" fn() -> u64 = block_gas_limit;
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn block_number() -> u64 {
+    // If we're inside an external contract, provide a default block number
+    if is_in_external_contract() {
+        return 1000000; // Default block number
+    }
+
     frame!(BlockNumber { number });
     number
 }
@@ -323,6 +445,11 @@ static BLOCK_NUMBER: unsafe extern "C" fn() -> u64 = block_number;
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn block_timestamp() -> u64 {
+    // If we're inside an external contract, provide a default timestamp
+    if is_in_external_contract() {
+        return 1700000000; // Default timestamp
+    }
+
     frame!(BlockTimestamp { timestamp });
     timestamp
 }
@@ -337,6 +464,11 @@ static BLOCK_TIMESTAMP: unsafe extern "C" fn() -> u64 = block_timestamp;
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn chainid() -> u64 {
+    // If we're inside an external contract, provide a default chainid
+    if is_in_external_contract() {
+        return 42161; // Arbitrum One chainid
+    }
+
     frame!(Chainid { chainid });
     chainid
 }
@@ -377,11 +509,52 @@ pub unsafe extern "C" fn call_contract(
         status,
         frame,
     });
+
+    // Notify debugger of context switch
+    if let Some(hook) = get_debugger_hook() {
+        let contract_addr = format!("0x{}", hex::encode(&address));
+        hook.on_external_call(&contract_addr, &frame);
+    }
+
     assert_eq!(read_fixed(address_ptr), address);
-    assert_eq!(read_bytes(calldata, calldata_len), &*data);
+    let input_data = read_bytes(calldata, calldata_len);
+    assert_eq!(input_data, &*data);
     assert_eq!(read_fixed(value_ptr), value.to_be_bytes::<32>());
     assert_eq!(gas_supplied, gas);
+
+    // Try to actually call the external contract if available for debugging
+    let access_guard = EXTERNAL_CONTRACT_ACCESS.lock();
+    if let Some(ref access) = *access_guard {
+        // Mark that we're entering an external contract
+        enter_external_contract();
+
+        let result = access.call_external_contract(&address, &input_data);
+
+        // Mark that we're exiting the external contract
+        exit_external_contract();
+
+        if let Ok((call_status, _return_data)) = result {
+                // Successfully called external contract for debugging
+                // Still use trace data for return values to maintain consistency
+                *return_data_len = outs_len;
+
+                // Notify debugger when returning
+                if let Some(hook) = get_debugger_hook() {
+                    hook.on_return_from_call();
+                }
+
+                return call_status;
+        }
+    }
+
+    // Fallback to trace data if external call not available or failed
     *return_data_len = outs_len;
+
+    // Notify debugger when returning
+    if let Some(hook) = get_debugger_hook() {
+        hook.on_return_from_call();
+    }
+
     status
 }
 
@@ -426,10 +599,23 @@ pub unsafe extern "C" fn delegate_call_contract(
         status,
         frame,
     });
+
+    // Notify debugger of context switch
+    if let Some(hook) = get_debugger_hook() {
+        let contract_addr = format!("0x{}", hex::encode(&address));
+        hook.on_external_call(&contract_addr, &frame);
+    }
+
     assert_eq!(read_fixed(address_ptr), address);
     assert_eq!(read_bytes(calldata, calldata_len), &*data);
     assert_eq!(gas_supplied, gas);
     *return_data_len = outs_len;
+
+    // Notify debugger when returning
+    if let Some(hook) = get_debugger_hook() {
+        hook.on_return_from_call();
+    }
+
     status
 }
 
@@ -473,10 +659,23 @@ pub unsafe extern "C" fn static_call_contract(
         status,
         frame,
     });
+
+    // Notify debugger of context switch
+    if let Some(hook) = get_debugger_hook() {
+        let contract_addr = format!("0x{}", hex::encode(&address));
+        hook.on_external_call(&contract_addr, &frame);
+    }
+
     assert_eq!(read_fixed(address_ptr), address);
     assert_eq!(read_bytes(calldata, calldata_len), &*data);
     assert_eq!(gas_supplied, gas);
     *return_data_len = outs_len;
+
+    // Notify debugger when returning
+    if let Some(hook) = get_debugger_hook() {
+        hook.on_return_from_call();
+    }
+
     status
 }
 
@@ -496,6 +695,14 @@ static STATIC_CALL_CONTRACT: unsafe extern "C" fn(
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn contract_address(dest: *mut u8) {
+    // If we're inside an external contract, provide a default address
+    if is_in_external_contract() {
+        // For external contracts, we can return a zero address or the actual external contract address
+        let zero_address = Address::ZERO;
+        copy!(zero_address, dest);
+        return;
+    }
+
     frame!(ContractAddress { address });
     copy!(address, dest);
 }
@@ -625,6 +832,11 @@ static EMIT_LOG: unsafe extern "C" fn(data_ptr: *const u8, len: u32, topic_count
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn evm_gas_left() -> u64 {
+    // If we're inside an external contract, provide a default gas amount
+    if is_in_external_contract() {
+        return 1000000; // Default gas
+    }
+
     frame!(EvmGasLeft { gas_left });
     gas_left
 }
@@ -754,6 +966,12 @@ static MATH_MUL_MOD: unsafe fn(value: *mut u8, multiplier: *const u8, modulus: *
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn msg_reentrant() -> bool {
+    // If we're inside an external contract, provide a default value
+    if is_in_external_contract() {
+        // External contracts default to non-reentrant
+        return false;
+    }
+
     frame!(MsgReentrant { reentrant });
     reentrant
 }
@@ -774,6 +992,15 @@ static MSG_REENTRANT: unsafe extern "C" fn() -> bool = msg_reentrant;
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn msg_sender(dest: *mut u8) {
+    // If we're inside an external contract, provide a default sender
+    if is_in_external_contract() {
+        // For external contracts, return the main contract address as sender
+        // This simulates the main contract calling the external contract
+        let sender = Address::ZERO; // Could use actual main contract address
+        copy!(sender, dest);
+        return;
+    }
+
     frame!(MsgSender { sender });
     copy!(sender, dest);
 }
@@ -788,6 +1015,14 @@ static MSG_SENDER: unsafe extern "C" fn(dest: *mut u8) = msg_sender;
 #[named]
 #[no_mangle]
 pub unsafe extern "C" fn msg_value(dest: *mut u8) {
+    // If we're inside an external contract, provide a default value
+    if is_in_external_contract() {
+        // For external contracts, return zero value
+        let zero_value = U256::ZERO.to_be_bytes::<32>();
+        copy!(zero_value, dest);
+        return;
+    }
+
     frame!(MsgValue { value });
     copy!(value, dest);
 }

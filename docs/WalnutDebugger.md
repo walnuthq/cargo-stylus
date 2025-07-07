@@ -168,3 +168,15 @@ To use `walnut-dbg`, specify `--debugger walnut-dbg`.
 ```bash
 $ cargo stylus replay --debugger walnut-dbg --tx <TX_HASH> [other args]
 ```
+
+If you want to debug multi-contract transaction, use:
+
+```bash
+$ cargo stylus replay --debugger walnut-dbg --tx <TX_HASH> \
+  --contracts ADDR:PATH,0xe1080224B632A93951A7CFA33EeEa9Fd81558b5e:../ \
+  --endpoint=$RPC_URL
+...
+(walnut-dbg) walnut-contract breakpoint 0xe1080224B632A93951A7CFA33EeEa9Fd81558b5e external_contract::ServiceContract::increment
+Set breakpoint on external_contract::ServiceContract::increment in contract 0xe1080224B632A93951A7CFA33EeEa9Fd81558b5e (ID: 3, 1 locations)
+...
+```

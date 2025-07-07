@@ -10,15 +10,19 @@ use alloy::{
 };
 use clap::{ArgGroup, Args, CommandFactory, Parser, Subcommand};
 use constants::DEFAULT_ENDPOINT;
+use debug_hook::DebuggerHook;
 use deploy::STYLUS_DEPLOYER_ADDRESS;
 use eyre::{bail, eyre, Context, Result};
 use std::{
+    collections::HashMap,
     fmt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tokio::runtime::Builder;
 use trace::Trace;
 use util::{color::Color, sys};
+use hostio::ExternalContractAccess;
 
 // Conditional import for Unix-specific `CommandExt`
 #[cfg(unix)]
@@ -41,6 +45,7 @@ mod activate;
 mod cache;
 mod check;
 mod constants;
+mod debug_hook;
 mod deploy;
 mod docker;
 mod export_abi;
@@ -341,6 +346,11 @@ struct ReplayArgs {
     /// Which debugger to use: gdb, lldb, walnut-dbg, or auto (auto-detect).
     #[arg(long, value_name = "DEBUGGER", default_value = "auto")]
     debugger: String,
+    /// Contract addresses and their source paths for multi-contract debugging.
+    /// Format: ADDRESS1:PATH1,ADDRESS2:PATH2,...
+    /// Example: 0x123...:./contractA,0x456...:./contractB
+    #[arg(long, value_delimiter = ',', value_name = "CONTRACTS")]
+    contracts: Option<Vec<String>>,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -359,6 +369,11 @@ struct UsertraceArgs {
     /// Whether this process is the child of another.
     #[arg(short, long, hide(true))]
     child: bool,
+    /// Contract addresses and their source paths for multi-contract debugging.
+    /// Format: ADDRESS1:PATH1,ADDRESS2:PATH2,...
+    /// Example: 0x123...:./contractA,0x456...:./contractB
+    #[arg(long, value_delimiter = ',', value_name = "CONTRACTS")]
+    contracts: Option<Vec<String>>,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -664,6 +679,140 @@ impl fmt::Display for VerifyConfig {
         write!(f, "{}", args.join(" "))
     }
 }
+
+/// Registry to manage contract addresses and their corresponding source paths and libraries
+#[derive(Debug)]
+struct ContractRegistry {
+    /// Mapping from contract address to project path
+    contracts: HashMap<Address, PathBuf>,
+    /// Cached shared libraries for each contract address
+    libraries: HashMap<Address, libloading::Library>,
+    /// Library paths for debug symbols
+    library_paths: HashMap<Address, PathBuf>,
+}
+
+
+impl ContractRegistry {
+    /// Create a new registry from CLI contract mappings
+    fn new(contract_mappings: Option<Vec<String>>) -> Result<Self> {
+        let mut contracts = HashMap::new();
+
+        if let Some(mappings) = contract_mappings {
+            for mapping in mappings {
+                let parts: Vec<&str> = mapping.split(':').collect();
+                if parts.len() != 2 {
+                    bail!("Invalid contract mapping format: {}. Expected ADDRESS:PATH", mapping);
+                }
+
+                let address = parts[0].parse::<Address>()
+                    .wrap_err_with(|| format!("Invalid address in mapping: {}", parts[0]))?;
+                let path = PathBuf::from(parts[1]);
+
+                if !path.exists() {
+                    bail!("Contract path does not exist: {}", path.display());
+                }
+
+                contracts.insert(address, path);
+            }
+        }
+
+        Ok(Self {
+            contracts,
+            libraries: HashMap::new(),
+            library_paths: HashMap::new(),
+        })
+    }
+
+    /// Build all contract projects
+    fn build_all(&self, features: Option<Vec<String>>) -> Result<()> {
+        for (address, path) in &self.contracts {
+            println!("Building contract at {} from {}", address, path.display());
+            build_shared_library(path, None, features.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Load a shared library for a contract address
+    fn load_library(&mut self, address: &Address) -> Result<Option<&libloading::Library>> {
+        if !self.contracts.contains_key(address) {
+            return Ok(None);
+        }
+
+        if !self.libraries.contains_key(address) {
+            let path = &self.contracts[address];
+            let library_extension = if cfg!(target_os = "macos") { ".dylib" } else { ".so" };
+            let shared_library = find_shared_library(path, library_extension)?;
+
+            unsafe {
+                let lib = libloading::Library::new(&shared_library)
+                    .wrap_err_with(|| format!("Failed to load library for {}: {}", address, shared_library.display()))?;
+                self.libraries.insert(*address, lib);
+                self.library_paths.insert(*address, shared_library);
+            }
+        }
+
+        Ok(self.libraries.get(address))
+    }
+
+    /// Check if a contract has source code available
+    fn has_source(&self, address: &Address) -> bool {
+        self.contracts.contains_key(address)
+    }
+
+    /// Get an already-loaded library (assumes load_library was called earlier)
+    fn get_loaded_library(&self, address: &Address) -> Option<&libloading::Library> {
+        self.libraries.get(address)
+    }
+
+    /// Load all contract libraries
+    fn load_all_libraries(&mut self) -> Result<()> {
+        let addresses: Vec<Address> = self.contracts.keys().copied().collect();
+        for address in addresses {
+            self.load_library(&address)?;
+        }
+        Ok(())
+    }
+
+    /// Get all contract debug info for debugger
+    fn get_all_debug_info(&self) -> Vec<(Address, PathBuf)> {
+        self.library_paths.iter()
+            .map(|(addr, path)| (*addr, path.clone()))
+            .collect()
+    }
+}
+
+impl ExternalContractAccess for ContractRegistry {
+    unsafe fn call_external_contract(&self, address: &Address, input_data: &[u8]) -> Result<(u8, Vec<u8>), Box<dyn std::error::Error>> {
+        // Check if we have a library loaded for this address
+        if let Some(lib) = self.libraries.get(address) {
+            // Set up the input data for the external contract
+            hostio::set_external_contract_input(input_data.to_vec());
+
+            // Get the user_entrypoint function from the external contract
+            type Entrypoint = unsafe extern "C" fn(usize) -> usize;
+            if let Ok(entrypoint) = lib.get::<Entrypoint>(b"user_entrypoint") {
+                // Call the external contract's user_entrypoint with the length of input data
+                let result = entrypoint(input_data.len());
+
+                // Convert result to expected format
+                let status = match result {
+                    0 => 0u8, // Success
+                    1 => 1u8, // Revert
+                    _ => 1u8, // Other errors treated as revert
+                };
+
+                // Clear the input data after execution
+                hostio::set_external_contract_input(Vec::new());
+
+                // Return empty data for now - in a full implementation we'd capture the actual return data
+                return Ok((status, Vec::new()));
+            }
+        }
+
+        Err("External contract not available for debugging".into())
+    }
+}
+
 
 // prints help message and exits
 fn exit_with_help_msg() -> ! {
@@ -998,54 +1147,83 @@ async fn usertrace(args: UsertraceArgs) -> eyre::Result<()> {
 async fn replay(args: ReplayArgs) -> Result<()> {
     let macos = cfg!(target_os = "macos");
     if !args.child {
-        let gdb_args = [
-            "--quiet",
-            "-ex=set breakpoint pending on",
-            "-ex=b user_entrypoint",
-            "-ex=r",
-            "--args",
-        ]
-        .as_slice();
-        let lldb_args = [
-            "--source-quietly",
-            "-o",
-            "b user_entrypoint",
-            "-o",
-            "r",
-            "--",
-        ]
-        .as_slice();
-        let walnut_args = [
-            "-o",
-            "b user_entrypoint",
-            "-o",
-            "r",
-            "--",
-        ]
-        .as_slice();
+        // Build contract registry early to prepare debug commands
+        let mut registry = ContractRegistry::new(args.contracts.clone())?;
+        if !registry.contracts.is_empty() {
+            registry.build_all(args.features.clone())?;
+            registry.load_all_libraries()?;
+        }
+
+        // Prepare debugger commands with contract info
+        let mut gdb_commands = vec![
+            "--quiet".to_string(),
+            "-ex=set breakpoint pending on".to_string(),
+        ];
+        let mut lldb_commands = vec!["--source-quietly".to_string()];
+        let mut walnut_commands = vec![];
+
+        // For walnut-dbg, use the new walnut-contract commands
+        for (addr, path) in registry.get_all_debug_info() {
+            walnut_commands.push("-o".to_string());
+            walnut_commands.push(format!("walnut-contract add {} {}", addr, path.display()));
+        }
+
+        // Set breakpoints on all user_entrypoints
+        if registry.contracts.is_empty() {
+            // Single contract mode
+            gdb_commands.push("-ex=b user_entrypoint".to_string());
+            lldb_commands.push("-o".to_string());
+            lldb_commands.push("b user_entrypoint".to_string());
+            walnut_commands.push("-o".to_string());
+            walnut_commands.push("b user_entrypoint".to_string());
+        } else {
+            // Multi-contract mode - set breakpoints for all contracts using walnut-contract
+            for addr in registry.contracts.keys() {
+                walnut_commands.push("-o".to_string());
+                walnut_commands.push(format!("walnut-contract breakpoint {} user_entrypoint", addr));
+            }
+            // Still set a general breakpoint for compatibility with GDB/LLDB
+            gdb_commands.push("-ex=b user_entrypoint".to_string());
+            lldb_commands.push("-o".to_string());
+            lldb_commands.push("b user_entrypoint".to_string());
+        }
+
+        // Add run command
+        gdb_commands.push("-ex=r".to_string());
+        gdb_commands.push("--args".to_string());
+        lldb_commands.push("-o".to_string());
+        lldb_commands.push("r".to_string());
+        lldb_commands.push("--".to_string());
+        walnut_commands.push("-o".to_string());
+        walnut_commands.push("r".to_string());
+        walnut_commands.push("--".to_string());
+
+        let gdb_args: Vec<&str> = gdb_commands.iter().map(|s| s.as_str()).collect();
+        let lldb_args: Vec<&str> = lldb_commands.iter().map(|s| s.as_str()).collect();
+        let walnut_args: Vec<&str> = walnut_commands.iter().map(|s| s.as_str()).collect();
 
         let (cmd_name, args) = match args.debugger.as_str() {
             "gdb" => {
                 if sys::command_exists("rust-gdb") && !macos {
-                    ("rust-gdb", &gdb_args)
+                    ("rust-gdb", gdb_args.as_slice())
                 } else if sys::command_exists("gdb") && !macos {
-                    ("gdb", &gdb_args)
+                    ("gdb", gdb_args.as_slice())
                 } else {
                     bail!("gdb not found or not supported on this platform")
                 }
             }
             "lldb" => {
                 if sys::command_exists("rust-lldb") {
-                    ("rust-lldb", &lldb_args)
+                    ("rust-lldb", lldb_args.as_slice())
                 } else if sys::command_exists("lldb") {
-                    ("lldb", &lldb_args)
+                    ("lldb", lldb_args.as_slice())
                 } else {
                     bail!("lldb not found")
                 }
             }
             "walnut-dbg" => {
                 if sys::command_exists("rust-walnut-dbg") {
-                    ("rust-walnut-dbg", &walnut_args)
+                    ("rust-walnut-dbg", walnut_args.as_slice())
                 } else {
                     bail!("rust-walnut-dbg not found")
                 }
@@ -1053,17 +1231,17 @@ async fn replay(args: ReplayArgs) -> Result<()> {
             "auto" => {
                 // Auto-detect the best available debugger
                 if sys::command_exists("rust-gdb") && !macos {
-                    ("rust-gdb", &gdb_args)
+                    ("rust-gdb", gdb_args.as_slice())
                 } else if sys::command_exists("rust-lldb") {
-                    ("rust-lldb", &lldb_args)
+                    ("rust-lldb", lldb_args.as_slice())
                 } else if sys::command_exists("rust-walnut-dbg") {
-                    ("rust-walnut-dbg", &walnut_args)
+                    ("rust-walnut-dbg", walnut_args.as_slice())
                 } else {
                     println!("rust specific debugger not installed, falling back to generic debugger");
                     if sys::command_exists("gdb") && !macos {
-                        ("gdb", &gdb_args)
+                        ("gdb", gdb_args.as_slice())
                     } else if sys::command_exists("lldb") {
-                        ("lldb", &lldb_args)
+                        ("lldb", lldb_args.as_slice())
                     } else {
                         bail!("no debugger found")
                     }
@@ -1093,22 +1271,90 @@ async fn replay(args: ReplayArgs) -> Result<()> {
     let provider = ProviderBuilder::new().connect(&args.trace.endpoint).await?;
     let trace = Trace::new(&provider, args.trace.tx, args.trace.use_native_tracer).await?;
 
-    build_shared_library(&args.trace.project, args.package, args.features)?;
-    let library_extension = if macos { ".dylib" } else { ".so" };
-    let shared_library = find_shared_library(&args.trace.project, library_extension)?;
+    // Create contract registry and build all contracts
+    let mut registry = ContractRegistry::new(args.contracts.clone())?;
+
+    // If no contracts specified, use the default project
+    if registry.contracts.is_empty() {
+        build_shared_library(&args.trace.project, args.package.clone(), args.features.clone())?;
+        let library_extension = if macos { ".dylib" } else { ".so" };
+        let shared_library = find_shared_library(&args.trace.project, library_extension)?;
+
+        // Get the contract address from the trace
+        let contract_address = trace.top_frame.address().unwrap_or_default();
+
+        // Load the default library
+        unsafe {
+            let lib = libloading::Library::new(&shared_library)?;
+            registry.contracts.insert(contract_address, args.trace.project.clone());
+            registry.libraries.insert(contract_address, lib);
+        }
+    } else {
+        // Build all specified contracts
+        registry.build_all(args.features.clone())?;
+    }
 
     // TODO: don't assume the contract is top-level
-    let Some(args) = &trace.tx.input.input else {
+    let Some(input_data) = &trace.tx.input.input else {
         bail!("missing transaction input");
     };
-    let args_len = args.len();
+    let args_len = input_data.len();
+
+    // Check if we have the main contract
+    let contract_address = trace.top_frame.address().unwrap_or_default();
+    if !registry.has_source(&contract_address) && registry.contracts.is_empty() {
+        // No contracts specified, use default behavior
+    } else if !registry.has_source(&contract_address) {
+        println!("\n{}", "════════ Warning ════════".yellow());
+        println!("Main contract at {} has no source code provided.", contract_address.yellow());
+        println!("Debugging will be limited.\n");
+    }
+
+    // Print information about available contracts
+    if !registry.contracts.is_empty() {
+        println!("\n{}", "════════ Multi-Contract Debug Session ════════".mint());
+        println!("Contracts with source code available:");
+        for (addr, path) in &registry.contracts {
+            println!("  {} -> {}", addr.mint(), path.display());
+        }
+        println!();
+    }
+
+    // Get the top-level contract address before consuming trace
+    let top_level_address = trace.top_frame.address().unwrap_or_default();
+
+    // Initialize debugger hook if using walnut-dbg
+    if args.debugger == "walnut-dbg" && !registry.contracts.is_empty() {
+        let hook = debug_hook::WalnutDebuggerHook::new()?;
+
+        // Send all contract info to debugger
+        let contracts: Vec<(String, String)> = registry.get_all_debug_info()
+            .into_iter()
+            .map(|(addr, path)| (format!("{}", addr), path.display().to_string()))
+            .collect();
+        hook.on_execution_start(&contracts);
+
+        debug_hook::init_debugger_hook(std::sync::Arc::new(hook));
+    }
 
     unsafe {
         *hostio::FRAME.lock() = Some(trace.reader());
 
+        // Load ALL contract libraries to make them available for debugging
+        registry.load_all_libraries()?;
+
+        // Wrap registry in Arc for external contract access
+        let registry_arc = Arc::new(registry);
+        hostio::set_external_contract_access(registry_arc.clone());
+
+        // Get the library for the top-level contract to execute
+        let lib = registry_arc.get_loaded_library(&top_level_address)
+            .ok_or_else(|| eyre!("No library found for contract {}", top_level_address))?;
+
         type Entrypoint = unsafe extern "C" fn(usize) -> usize;
-        let lib = libloading::Library::new(shared_library)?;
         let main: libloading::Symbol<Entrypoint> = lib.get(b"user_entrypoint")?;
+
+        println!("Starting execution at contract: {}", top_level_address.mint());
 
         match main(args_len) {
             0 => println!("call completed successfully"),
@@ -1134,6 +1380,13 @@ pub fn build_shared_library(
     if let Some(p) = package {
         cargo.arg("--package").arg(p);
     }
+
+    // Set linker flags to allow undefined symbols for external contracts
+    #[cfg(target_os = "macos")]
+    cargo.env("RUSTFLAGS", "-C link-arg=-undefined -C link-arg=dynamic_lookup");
+
+    #[cfg(target_os = "linux")]
+    cargo.env("RUSTFLAGS", "-C link-arg=-Wl,--allow-shlib-undefined");
 
     cargo
         .arg("--lib")

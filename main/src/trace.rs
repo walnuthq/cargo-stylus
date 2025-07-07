@@ -161,6 +161,10 @@ impl TraceFrame {
         Self { steps, address }
     }
 
+    pub fn address(&self) -> Option<Address> {
+        self.address
+    }
+
     pub fn parse_frame(address: Option<Address>, array: Value) -> Result<TraceFrame> {
         let mut frame = TraceFrame::new(address);
 
