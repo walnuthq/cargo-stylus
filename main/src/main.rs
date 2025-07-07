@@ -124,7 +124,7 @@ enum Apis {
     Verify(VerifyConfig),
     /// Generate c code bindings for a Stylus contract.
     Cgen { input: PathBuf, out_dir: PathBuf },
-    /// Replay a transaction in gdb.
+    /// Replay a transaction in gdb, lldb, or walnut-dbg.
     #[command(visible_alias = "r")]
     Replay(ReplayArgs),
     /// Trace a transaction with walnut-dbg, capturing user function calls.
@@ -338,6 +338,9 @@ struct ReplayArgs {
     /// Whether this process is the child of another.
     #[arg(short, long, hide(true))]
     child: bool,
+    /// Which debugger to use: gdb, lldb, walnut-dbg, or auto (auto-detect).
+    #[arg(long, value_name = "DEBUGGER", default_value = "auto")]
+    debugger: String,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -1012,20 +1015,63 @@ async fn replay(args: ReplayArgs) -> Result<()> {
             "--",
         ]
         .as_slice();
-        let (cmd_name, args) = if sys::command_exists("rust-gdb") && !macos {
-            ("rust-gdb", &gdb_args)
-        } else if sys::command_exists("rust-lldb") {
-            ("rust-lldb", &lldb_args)
-        } else {
-            println!("rust specific debugger not installed, falling back to generic debugger");
-            if sys::command_exists("gdb") && !macos {
-                ("gdb", &gdb_args)
-            } else if sys::command_exists("lldb") {
-                ("lldb", &lldb_args)
-            } else {
-                bail!("no debugger found")
+        let walnut_args = [
+            "-o",
+            "b user_entrypoint",
+            "-o",
+            "r",
+            "--",
+        ]
+        .as_slice();
+
+        let (cmd_name, args) = match args.debugger.as_str() {
+            "gdb" => {
+                if sys::command_exists("rust-gdb") && !macos {
+                    ("rust-gdb", &gdb_args)
+                } else if sys::command_exists("gdb") && !macos {
+                    ("gdb", &gdb_args)
+                } else {
+                    bail!("gdb not found or not supported on this platform")
+                }
             }
+            "lldb" => {
+                if sys::command_exists("rust-lldb") {
+                    ("rust-lldb", &lldb_args)
+                } else if sys::command_exists("lldb") {
+                    ("lldb", &lldb_args)
+                } else {
+                    bail!("lldb not found")
+                }
+            }
+            "walnut-dbg" => {
+                if sys::command_exists("rust-walnut-dbg") {
+                    ("rust-walnut-dbg", &walnut_args)
+                } else {
+                    bail!("rust-walnut-dbg not found")
+                }
+            }
+            "auto" => {
+                // Auto-detect the best available debugger
+                if sys::command_exists("rust-gdb") && !macos {
+                    ("rust-gdb", &gdb_args)
+                } else if sys::command_exists("rust-lldb") {
+                    ("rust-lldb", &lldb_args)
+                } else if sys::command_exists("rust-walnut-dbg") {
+                    ("rust-walnut-dbg", &walnut_args)
+                } else {
+                    println!("rust specific debugger not installed, falling back to generic debugger");
+                    if sys::command_exists("gdb") && !macos {
+                        ("gdb", &gdb_args)
+                    } else if sys::command_exists("lldb") {
+                        ("lldb", &lldb_args)
+                    } else {
+                        bail!("no debugger found")
+                    }
+                }
+            }
+            _ => bail!("Unknown debugger: {}. Supported debuggers: gdb, lldb, walnut-dbg, auto", args.debugger)
         };
+
         let mut cmd = sys::new_command(cmd_name);
         for arg in args.iter() {
             cmd.arg(arg);

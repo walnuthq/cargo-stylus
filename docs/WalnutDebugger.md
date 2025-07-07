@@ -160,3 +160,11 @@ cargo stylus usertrace \
 ```
 
 and it will track calls from `std::`, `core` and `other_contract::`.
+
+### Run `replay` option with `walnut-dbg`
+
+To use `walnut-dbg`, specify `--debugger walnut-dbg`.
+
+```bash
+$ cargo stylus replay --debugger walnut-dbg --tx <TX_HASH> [other args]
+```
