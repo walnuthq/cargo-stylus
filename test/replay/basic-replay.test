@@ -1,0 +1,7 @@
+# Test basic replay functionality with counter contract
+# REQUIRES: walnut-dbg
+# RUN: cd %{contracts}/counter && %cargo-stylus replay --tx %{counter_tx} --endpoint %{rpc_url} --debugger walnut-dbg 2>&1 | FileCheck %s
+
+# CHECK: (walnut-dbg)
+# CHECK: target create
+# CHECK: settings set -- target.run-args "stylus" "replay"

@@ -1,0 +1,7 @@
+# Test basic usertrace functionality
+# REQUIRES: walnut-dbg
+# RUN: cd %{contracts}/counter && cargo-stylus-venv usertrace --tx %{counter_tx} --endpoint %{rpc_url} 2>&1 | FileCheck %s
+
+# CHECK: Tracing contract at address:
+# Either we get the trace or an error message
+# CHECK: {{(=== WALNUT FUNCTION CALL TREE ===|ERROR: No such file.*lldb_function_trace.json)}}

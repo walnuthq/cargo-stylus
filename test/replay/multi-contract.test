@@ -1,0 +1,7 @@
+# Test multi-contract replay functionality
+# REQUIRES: walnut-dbg
+# RUN: %cargo-stylus replay --tx %{caller_tx} --endpoint %{rpc_url} --contracts %{counter_address}:%{contracts}/counter,%{caller_address}:%{contracts}/caller --debugger walnut-dbg 2>&1 | FileCheck %s
+
+# CHECK: Building contract at
+# CHECK: from {{.*}}counter
+# CHECK: {{(walnut-dbg|Compiling)}}

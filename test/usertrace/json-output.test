@@ -1,0 +1,8 @@
+# Test usertrace output format
+# REQUIRES: walnut-dbg
+# RUN: cd %{contracts}/counter && cargo-stylus-venv usertrace --tx %{counter_tx} --endpoint %{rpc_url} 2>&1 | FileCheck %s
+
+# CHECK: Tracing contract at address:
+# CHECK: === WALNUT FUNCTION CALL TREE ===
+# CHECK: counter::{{.*}}increment
+# CHECK: counter::{{.*}}set_number
