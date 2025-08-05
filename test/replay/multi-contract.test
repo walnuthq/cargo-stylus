@@ -2,6 +2,6 @@
 # REQUIRES: walnut-dbg
 # RUN: %cargo-stylus replay --tx %{caller_tx} --endpoint %{rpc_url} --contracts %{counter_address}:%{contracts}/counter,%{caller_address}:%{contracts}/caller --debugger walnut-dbg 2>&1 | FileCheck %s
 
-# CHECK: Building contract at
+# CHECK: Building Stylus contract at
 # CHECK: from {{.*}}counter
-# CHECK: {{(walnut-dbg|Compiling)}}
+# CHECK: {{(walnut-dbg|Compiling|Blocking waiting for file lock)}}
