@@ -180,3 +180,30 @@ $ cargo stylus replay --debugger walnut-dbg --tx <TX_HASH> \
 Set breakpoint on external_contract::ServiceContract::increment in contract 0xe1080224B632A93951A7CFA33EeEa9Fd81558b5e (ID: 3, 1 locations)
 ...
 ```
+
+### Debugging Transactions with Solidity Contract Calls
+
+When debugging transactions that involve calls from Stylus to Solidity contracts, you can use the `--addr-solidity` flag to mark specific addresses as Solidity contracts:
+
+```bash
+$ cargo stylus replay --debugger walnut-dbg --tx <TX_HASH> \
+  --addr-solidity=0xda52b25ddb0e3b9cc393b0690ac62245ac772527 \
+  --endpoint=$RPC_URL
+```
+
+When the debugger encounters a call to a Solidity contract, it will display:
+
+```
+════════ Solidity Contract Call ════════
+Contract: 0xda52b25ddb0e3b9cc393b0690ac62245ac772527
+Function selector: 0xd09de08a (increment())
+NOTE: This is a Solidity contract - skipping to next contract
+```
+
+The debugger will:
+- Show the Solidity contract address
+- Display the function selector (first 4 bytes of calldata)
+- Attempt to decode the function name using 4byte.directory (if available)
+- Continue execution after the Solidity call returns
+
+This allows you to trace execution flow across mixed Stylus/Solidity transactions, even though source-level debugging is only available for Stylus contracts.

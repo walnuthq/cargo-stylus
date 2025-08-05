@@ -13,8 +13,9 @@ use constants::DEFAULT_ENDPOINT;
 use debug_hook::DebuggerHook;
 use deploy::STYLUS_DEPLOYER_ADDRESS;
 use eyre::{bail, eyre, Context, Result};
+use hex;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -405,13 +406,12 @@ struct TraceArgs {
     #[arg(long, default_value_t = false)]
     enable_walnutdbg_output: bool,
 
-    /// Solidity contract address for EVM-level callTracer.
-    #[arg(
-        long,
-        value_name = "ADDRESS",
-        value_parser = clap::value_parser!(H160)
-    )]
-    addr_solidity: Option<H160>,
+    /// Solidity contract addresses. These contracts will be recognized as Solidity
+    /// contracts and displayed accordingly during debugging.
+    /// Format: ADDRESS1,ADDRESS2,...
+    /// Example: 0xda52b25ddb0e3b9cc393b0690ac62245ac772527
+    #[arg(long, value_delimiter = ',', value_name = "ADDRESSES", require_equals = false)]
+    addr_solidity: Option<Vec<String>>,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -680,23 +680,52 @@ impl fmt::Display for VerifyConfig {
     }
 }
 
+/// Type of contract (Stylus or Solidity)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContractType {
+    Stylus,
+    Solidity,
+}
+
+/// Information about a contract
+#[derive(Debug)]
+struct ContractInfo {
+    /// Path to the contract source/project
+    path: PathBuf,
+    /// Type of the contract
+    contract_type: ContractType,
+}
+
 /// Registry to manage contract addresses and their corresponding source paths and libraries
 #[derive(Debug)]
 struct ContractRegistry {
-    /// Mapping from contract address to project path
-    contracts: HashMap<Address, PathBuf>,
-    /// Cached shared libraries for each contract address
+    /// Mapping from contract address to contract info
+    contracts: HashMap<Address, ContractInfo>,
+    /// Cached shared libraries for each contract address (only for Stylus contracts)
     libraries: HashMap<Address, libloading::Library>,
-    /// Library paths for debug symbols
+    /// Library paths for debug symbols (only for Stylus contracts)
     library_paths: HashMap<Address, PathBuf>,
+    /// Solidity contract addresses explicitly marked via CLI
+    solidity_contracts: HashSet<Address>,
 }
 
 
 impl ContractRegistry {
-    /// Create a new registry from CLI contract mappings
-    fn new(contract_mappings: Option<Vec<String>>) -> Result<Self> {
+    /// Create a new registry from CLI contract mappings and Solidity contract addresses
+    fn new(contract_mappings: Option<Vec<String>>, solidity_addresses: Option<Vec<String>>) -> Result<Self> {
         let mut contracts = HashMap::new();
+        let mut solidity_contracts = HashSet::new();
 
+        // Parse Solidity contract addresses
+        if let Some(addresses) = solidity_addresses {
+            for addr_str in addresses {
+                let address = addr_str.parse::<Address>()
+                    .wrap_err_with(|| format!("Invalid Solidity contract address: {}", addr_str))?;
+                solidity_contracts.insert(address);
+            }
+        }
+
+        // Parse contract mappings
         if let Some(mappings) = contract_mappings {
             for mapping in mappings {
                 let parts: Vec<&str> = mapping.split(':').collect();
@@ -712,7 +741,17 @@ impl ContractRegistry {
                     bail!("Contract path does not exist: {}", path.display());
                 }
 
-                contracts.insert(address, path);
+                // Determine contract type
+                let contract_type = if solidity_contracts.contains(&address) {
+                    ContractType::Solidity
+                } else {
+                    ContractType::Stylus
+                };
+
+                contracts.insert(address, ContractInfo {
+                    path,
+                    contract_type,
+                });
             }
         }
 
@@ -720,38 +759,47 @@ impl ContractRegistry {
             contracts,
             libraries: HashMap::new(),
             library_paths: HashMap::new(),
+            solidity_contracts,
         })
     }
 
-    /// Build all contract projects
+    /// Build all Stylus contract projects (Solidity contracts don't need building)
     fn build_all(&self, features: Option<Vec<String>>) -> Result<()> {
-        for (address, path) in &self.contracts {
-            println!("Building contract at {} from {}", address, path.display());
-            build_shared_library(path, None, features.clone())?;
+        for (address, info) in &self.contracts {
+            if info.contract_type == ContractType::Stylus {
+                println!("Building Stylus contract at {} from {}", address, info.path.display());
+                build_shared_library(&info.path, None, features.clone())?;
+            } else {
+                println!("Skipping Solidity contract at {} (no build needed)", address);
+            }
         }
         Ok(())
     }
 
-    /// Load a shared library for a contract address
+    /// Load a shared library for a contract address (only for Stylus contracts)
     fn load_library(&mut self, address: &Address) -> Result<Option<&libloading::Library>> {
-        if !self.contracts.contains_key(address) {
-            return Ok(None);
-        }
-
-        if !self.libraries.contains_key(address) {
-            let path = &self.contracts[address];
-            let library_extension = if cfg!(target_os = "macos") { ".dylib" } else { ".so" };
-            let shared_library = find_shared_library(path, library_extension)?;
-
-            unsafe {
-                let lib = libloading::Library::new(&shared_library)
-                    .wrap_err_with(|| format!("Failed to load library for {}: {}", address, shared_library.display()))?;
-                self.libraries.insert(*address, lib);
-                self.library_paths.insert(*address, shared_library);
+        if let Some(info) = self.contracts.get(address) {
+            // Only load libraries for Stylus contracts
+            if info.contract_type == ContractType::Solidity {
+                return Ok(None);
             }
-        }
 
-        Ok(self.libraries.get(address))
+            if !self.libraries.contains_key(address) {
+                let library_extension = if cfg!(target_os = "macos") { ".dylib" } else { ".so" };
+                let shared_library = find_shared_library(&info.path, library_extension)?;
+
+                unsafe {
+                    let lib = libloading::Library::new(&shared_library)
+                        .wrap_err_with(|| format!("Failed to load library for {}: {}", address, shared_library.display()))?;
+                    self.libraries.insert(*address, lib);
+                    self.library_paths.insert(*address, shared_library);
+                }
+            }
+
+            Ok(self.libraries.get(address))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Check if a contract has source code available
@@ -764,16 +812,29 @@ impl ContractRegistry {
         self.libraries.get(address)
     }
 
-    /// Load all contract libraries
+    /// Get the type of a contract
+    fn get_contract_type(&self, address: &Address) -> Option<ContractType> {
+        self.contracts.get(address).map(|info| info.contract_type)
+    }
+
+    /// Check if a contract is a Solidity contract
+    fn is_solidity_contract(&self, address: &Address) -> bool {
+        self.get_contract_type(address) == Some(ContractType::Solidity) || 
+        self.solidity_contracts.contains(address)
+    }
+
+    /// Load all contract libraries (only Stylus contracts)
     fn load_all_libraries(&mut self) -> Result<()> {
         let addresses: Vec<Address> = self.contracts.keys().copied().collect();
         for address in addresses {
-            self.load_library(&address)?;
+            if !self.is_solidity_contract(&address) {
+                self.load_library(&address)?;
+            }
         }
         Ok(())
     }
 
-    /// Get all contract debug info for debugger
+    /// Get all contract debug info for debugger (only Stylus contracts have debug symbols)
     fn get_all_debug_info(&self) -> Vec<(Address, PathBuf)> {
         self.library_paths.iter()
             .map(|(addr, path)| (*addr, path.clone()))
@@ -783,7 +844,34 @@ impl ContractRegistry {
 
 impl ExternalContractAccess for ContractRegistry {
     unsafe fn call_external_contract(&self, address: &Address, input_data: &[u8]) -> Result<(u8, Vec<u8>), Box<dyn std::error::Error>> {
-        // Check if we have a library loaded for this address
+        // Check if this is a Solidity contract (either explicitly marked or in solidity_contracts set)
+        if self.is_solidity_contract(address) {
+            // Extract function selector (first 4 bytes) if available
+            let (selector, function_sig) = if input_data.len() >= 4 {
+                let selector = format!("0x{}", hex::encode(&input_data[..4]));
+                
+                // Try to decode function signature from 4byte.directory
+                let function_sig = match decode_function_selector(&selector) {
+                    Some(sig) => format!(" ({})", sig),
+                    None => String::new(),
+                };
+                
+                (selector, function_sig)
+            } else {
+                ("unknown".to_string(), String::new())
+            };
+            
+            eprintln!("\n{}", "════════ Solidity Contract Call ════════".yellow());
+            eprintln!("Contract: {}", address.yellow());
+            eprintln!("Function selector: {}{}", selector.mint(), function_sig.mint());
+            eprintln!("NOTE: This is a Solidity contract - skipping to next contract\n");
+            
+            // For now, return success with empty data
+            // In the future, we could integrate walnut-cli here
+            return Ok((0, Vec::new()));
+        }
+        
+        // Check if we have a library loaded for this address (Stylus contract)
         if let Some(lib) = self.libraries.get(address) {
             // Set up the input data for the external contract
             hostio::set_external_contract_input(input_data.to_vec());
@@ -809,10 +897,52 @@ impl ExternalContractAccess for ContractRegistry {
             }
         }
 
-        Err("External contract not available for debugging".into())
+        // If we don't have info about this contract, it might be an unregistered contract
+        eprintln!("\n{}", "════════ External Contract Call ════════".yellow());
+        eprintln!("Contract: {}", address.yellow());
+        eprintln!("No source code available for this contract");
+        eprintln!("It may be a Solidity contract or unregistered Stylus contract\n");
+
+        // Return success for now
+        Ok((0, Vec::new()))
     }
 }
 
+
+/// Try to decode a function selector using 4byte.directory API
+fn decode_function_selector(selector: &str) -> Option<String> {
+    // Only try to decode if we have a proper selector
+    if !selector.starts_with("0x") || selector.len() != 10 {
+        return None;
+    }
+    
+    // Use a very short timeout to avoid blocking
+    let client = std::process::Command::new("curl")
+        .arg("-s")
+        .arg("--max-time")
+        .arg("2")  // 2 second timeout
+        .arg(format!("https://www.4byte.directory/api/v1/signatures/?hex_signature={}", selector))
+        .output();
+    
+    match client {
+        Ok(output) if output.status.success() => {
+            // Try to parse the JSON response
+            if let Ok(json_str) = String::from_utf8(output.stdout) {
+                // Simple JSON parsing to extract text_signature
+                // Looking for: {"results":[{"text_signature":"increment()"},...]}
+                if let Some(start) = json_str.find("\"text_signature\":\"") {
+                    let start_idx = start + 18;
+                    if let Some(end) = json_str[start_idx..].find('"') {
+                        return Some(json_str[start_idx..start_idx + end].to_string());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    
+    None
+}
 
 // prints help message and exits
 fn exit_with_help_msg() -> ! {
@@ -1045,25 +1175,30 @@ async fn usertrace(args: UsertraceArgs) -> eyre::Result<()> {
     }
 
     // If the user supplied --addr-solidity, pull the EVM callTracer tree
-    if let Some(sol_addr) = args.trace.addr_solidity {
-        let raw = json!([
-            args.trace.tx,
-            { "tracer": "callTracer", "to": sol_addr }
-        ]);
-        let dbg: DebugTraceResult = provider
-            .raw_request::<serde_json::Value, DebugTraceResult>(
-                std::borrow::Cow::Borrowed("debug_traceTransaction"),
-                raw,
-            )
-            .await
-            .wrap_err("debug_traceTransaction failed")?;
+    if let Some(ref sol_addrs) = args.trace.addr_solidity {
+        if let Some(first_addr) = sol_addrs.first() {
+            // Parse the first address
+            if let Ok(sol_addr) = first_addr.parse::<H160>() {
+                let raw = json!([
+                    args.trace.tx,
+                    { "tracer": "callTracer", "to": sol_addr }
+                ]);
+                let dbg: DebugTraceResult = provider
+                    .raw_request::<serde_json::Value, DebugTraceResult>(
+                        std::borrow::Cow::Borrowed("debug_traceTransaction"),
+                        raw,
+                    )
+                    .await
+                    .wrap_err("debug_traceTransaction failed")?;
 
-        let _ = std::fs::remove_file("/tmp/sol_trace.json");
-        // Write out the solidity tracer JSON for the pretty-printer.
-        std::fs::write(
-            "/tmp/sol_trace.json",
-            serde_json::to_string_pretty(&dbg)?,
-        )?;
+                let _ = std::fs::remove_file("/tmp/sol_trace.json");
+                // Write out the solidity tracer JSON for the pretty-printer.
+                std::fs::write(
+                    "/tmp/sol_trace.json",
+                    serde_json::to_string_pretty(&dbg)?,
+                )?;
+            }
+        }
     }
 
     // Build the walnut-dbg calltrace command.
@@ -1115,7 +1250,7 @@ async fn usertrace(args: UsertraceArgs) -> eyre::Result<()> {
         let mut pp = sys::new_command("pretty-print-trace");
         pp.arg("/tmp/lldb_function_trace.json");
         // Only pass solidity file if we generated it.
-        if args.trace.addr_solidity.is_some() {
+        if args.trace.addr_solidity.is_some() && !args.trace.addr_solidity.as_ref().unwrap().is_empty() {
             pp.arg("/tmp/sol_trace.json");
         }
         let mut child = pp.spawn()?;
@@ -1148,7 +1283,7 @@ async fn replay(args: ReplayArgs) -> Result<()> {
     let macos = cfg!(target_os = "macos");
     if !args.child {
         // Build contract registry early to prepare debug commands
-        let mut registry = ContractRegistry::new(args.contracts.clone())?;
+        let mut registry = ContractRegistry::new(args.contracts.clone(), args.trace.addr_solidity.clone())?;
         if !registry.contracts.is_empty() {
             registry.build_all(args.features.clone())?;
             registry.load_all_libraries()?;
@@ -1272,10 +1407,25 @@ async fn replay(args: ReplayArgs) -> Result<()> {
     let trace = Trace::new(&provider, args.trace.tx, args.trace.use_native_tracer).await?;
 
     // Create contract registry and build all contracts
-    let mut registry = ContractRegistry::new(args.contracts.clone())?;
+    let mut registry = ContractRegistry::new(args.contracts.clone(), args.trace.addr_solidity.clone())?;
+
+    // Add Solidity contracts to registry even if no explicit contract mapping provided
+    if let Some(ref solidity_addrs) = args.trace.addr_solidity {
+        for addr_str in solidity_addrs {
+            if let Ok(address) = addr_str.parse::<Address>() {
+                // Only add if not already in registry
+                if !registry.contracts.contains_key(&address) {
+                    registry.contracts.insert(address, ContractInfo {
+                        path: PathBuf::from("(Solidity contract - no source path)"),
+                        contract_type: ContractType::Solidity,
+                    });
+                }
+            }
+        }
+    }
 
     // If no contracts specified, use the default project
-    if registry.contracts.is_empty() {
+    if registry.contracts.is_empty() || (registry.contracts.len() == registry.solidity_contracts.len() && !registry.solidity_contracts.is_empty()) {
         build_shared_library(&args.trace.project, args.package.clone(), args.features.clone())?;
         let library_extension = if macos { ".dylib" } else { ".so" };
         let shared_library = find_shared_library(&args.trace.project, library_extension)?;
@@ -1286,8 +1436,12 @@ async fn replay(args: ReplayArgs) -> Result<()> {
         // Load the default library
         unsafe {
             let lib = libloading::Library::new(&shared_library)?;
-            registry.contracts.insert(contract_address, args.trace.project.clone());
+            registry.contracts.insert(contract_address, ContractInfo {
+                path: args.trace.project.clone(),
+                contract_type: ContractType::Stylus,  // Default to Stylus when no explicit type
+            });
             registry.libraries.insert(contract_address, lib);
+            registry.library_paths.insert(contract_address, shared_library);
         }
     } else {
         // Build all specified contracts
@@ -1314,8 +1468,12 @@ async fn replay(args: ReplayArgs) -> Result<()> {
     if !registry.contracts.is_empty() {
         println!("\n{}", "════════ Multi-Contract Debug Session ════════".mint());
         println!("Contracts with source code available:");
-        for (addr, path) in &registry.contracts {
-            println!("  {} -> {}", addr.mint(), path.display());
+        for (addr, info) in &registry.contracts {
+            let contract_type_str = match info.contract_type {
+                ContractType::Stylus => "[Stylus]",
+                ContractType::Solidity => "[Solidity]",
+            };
+            println!("  {} {} -> {}", addr.mint(), contract_type_str.mint(), info.path.display());
         }
         println!();
     }
@@ -1333,6 +1491,11 @@ async fn replay(args: ReplayArgs) -> Result<()> {
             .map(|(addr, path)| (format!("{}", addr), path.display().to_string()))
             .collect();
         hook.on_execution_start(&contracts);
+        
+        // Send contract type information
+        for (addr, info) in &registry.contracts {
+            hook.on_contract_info(&format!("{}", addr), info.contract_type == ContractType::Solidity);
+        }
 
         debug_hook::init_debugger_hook(std::sync::Arc::new(hook));
     }

@@ -15,6 +15,9 @@ pub trait DebuggerHook: Send + Sync {
 
     /// Called when execution starts
     fn on_execution_start(&self, contracts: &[(String, String)]);
+    
+    /// Called to register contract metadata
+    fn on_contract_info(&self, contract_address: &str, is_solidity: bool);
 }
 
 /// No-op implementation for when no debugger is attached
@@ -24,6 +27,7 @@ impl DebuggerHook for NoOpDebuggerHook {
     fn on_external_call(&self, _contract_address: &str, _frame: &TraceFrame) {}
     fn on_return_from_call(&self) {}
     fn on_execution_start(&self, _contracts: &[(String, String)]) {}
+    fn on_contract_info(&self, _contract_address: &str, _is_solidity: bool) {}
 }
 
 /// Walnut debugger hook that communicates via Unix socket
@@ -92,6 +96,11 @@ impl DebuggerHook for WalnutDebuggerHook {
         for (addr, path) in contracts {
             self.send_command(&format!("contract_add {} {}", addr, path));
         }
+    }
+    
+    fn on_contract_info(&self, contract_address: &str, is_solidity: bool) {
+        let contract_type = if is_solidity { "solidity" } else { "stylus" };
+        self.send_command(&format!("contract_type {} {}", contract_address, contract_type));
     }
 }
 
