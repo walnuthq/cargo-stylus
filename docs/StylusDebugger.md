@@ -9,7 +9,7 @@ To use this, you need to install `stylusdb` tool from [stylusdb](https://github.
 Second, install this `cargo` tool (NOTE: This will be merged into original `cargo-stylus`).
 
 ```bash
-git https://github.com/walnuthq/cargo-stylus.git
+git clone https://github.com/walnuthq/cargo-stylus.git
 cd cargo-stylus
 cargo build
 ```
@@ -181,6 +181,93 @@ Set breakpoint on external_contract::ServiceContract::increment in contract 0xe1
 ...
 ```
 
+### Setting Breakpoints in StylusDB
+
+StylusDB provides the `stylus-contract` command for managing breakpoints in multi-contract debugging sessions. Here are the available commands and examples:
+
+#### Adding Contracts
+
+Before setting breakpoints, you need to add the contract to the debugger:
+
+```bash
+(stylusdb) stylus-contract add 0xA6E41fFD769491a42A6e5Ce453259b93983a22EF ./target/debug/libmy_contract.dylib
+Added contract 0xA6E41fFD769491a42A6e5Ce453259b93983a22EF with library ./target/debug/libmy_contract.dylib
+```
+
+#### Setting Breakpoints
+
+Set breakpoints on specific functions within a contract:
+
+```bash
+# Break on a specific function
+(stylusdb) stylus-contract breakpoint 0xA6E41fFD769491a42A6e5Ce453259b93983a22EF stylus_hello_world::Counter::increment
+Set breakpoint on stylus_hello_world::Counter::increment in contract 0xA6E41fFD769491a42A6e5Ce453259b93983a22EF (ID: 1, 1 locations)
+
+# Break on the entrypoint
+(stylusdb) stylus-contract breakpoint 0xA6E41fFD769491a42A6e5Ce453259b93983a22EF user_entrypoint
+Set breakpoint on user_entrypoint in contract 0xA6E41fFD769491a42A6e5Ce453259b93983a22EF (ID: 2, 1 locations)
+
+# Break on internal functions
+(stylusdb) stylus-contract breakpoint 0xA6E41fFD769491a42A6e5Ce453259b93983a22EF stylus_hello_world::Counter::set_number
+Set breakpoint on stylus_hello_world::Counter::set_number in contract 0xA6E41fFD769491a42A6e5Ce453259b93983a22EF (ID: 3, 1 locations)
+```
+
+#### Other Useful Commands
+
+```bash
+# List all registered contracts
+(stylusdb) stylus-contract list
+Registered contracts:
+  0xA6E41fFD769491a42A6e5Ce453259b93983a22EF -> ./target/debug/libmy_contract.dylib (3 breakpoints)
+  0xe1080224B632A93951A7CFA33EeEa9Fd81558b5e -> ../external/target/debug/libexternal.dylib (1 breakpoint)
+
+# Show the current call stack
+(stylusdb) stylus-contract stack
+Call stack: main -> 0xA6E41fFD769491a42A6e5Ce453259b93983a22EF -> 0xe1080224B632A93951A7CFA33EeEa9Fd81558b5e
+
+# Switch debugging context to a specific contract
+(stylusdb) stylus-contract context 0xe1080224B632A93951A7CFA33EeEa9Fd81558b5e
+Switched context to contract 0xe1080224B632A93951A7CFA33EeEa9Fd81558b5e
+Module: ../external/target/debug/libexternal.dylib
+
+# Show current context
+(stylusdb) stylus-contract context show
+Current context: 0xe1080224B632A93951A7CFA33EeEa9Fd81558b5e
+```
+
+#### Standard LLDB Commands
+
+In addition to `stylus-contract` commands, you can use standard LLDB commands:
+
+```bash
+# Continue execution
+(stylusdb) c
+
+# Step over
+(stylusdb) n
+
+# Step into
+(stylusdb) s
+
+# Print variable
+(stylusdb) p number
+
+# Print with formatting (for Rust types)
+(stylusdb) expr -f hex -- number.limbs[0]
+
+# Show backtrace
+(stylusdb) bt
+
+# List breakpoints
+(stylusdb) breakpoint list
+
+# Delete a breakpoint
+(stylusdb) breakpoint delete 1
+
+# Quit debugger
+(stylusdb) q
+```
+
 ### Debugging Transactions with Solidity Contract Calls
 
 When debugging transactions that involve calls from Stylus to Solidity contracts, you can use the `--addr-solidity` flag to mark specific addresses as Solidity contracts:
@@ -207,3 +294,37 @@ The debugger will:
 - Continue execution after the Solidity call returns
 
 This allows you to trace execution flow across mixed Stylus/Solidity transactions, even though source-level debugging is only available for Stylus contracts.
+
+#### Important Note on Contract Paths
+
+When specifying contracts with the `--contracts` flag, you can only provide directory paths for Rust/Stylus contracts. Solidity contracts do not support full debugging and cannot be built from source directories.
+
+**Incorrect usage (will fail):**
+```bash
+# This will error because ../erc20 is a Solidity contract directory
+cargo stylus replay --debugger stylusdb \
+  --tx=0xb590941f5de2a2164b76143ef4ca9d27df2d7c718c058fd2bbef4ac56b72d149 \
+  --contracts 0xa6e41ffd769491a42a6e5ce453259b93983a22ef:.,0x1294b86822ff4976BfE136cB06CF43eC7FCF2574:../erc20
+```
+
+This will produce an error:
+```
+error: could not find `Cargo.toml` in `/path/to/erc20` or any parent directory
+Error: failed to replay tx
+Caused by:
+    failed to open ../erc20/target/aarch64-apple-darwin/debug/: No such file or directory
+```
+
+**Correct usage:**
+```bash
+# Only specify the Solidity contract address without a path
+cargo stylus replay --debugger stylusdb \
+  --tx=0xb590941f5de2a2164b76143ef4ca9d27df2d7c718c058fd2bbef4ac56b72d149 \
+  --contracts 0xa6e41ffd769491a42a6e5ce453259b93983a22ef:.,0x1294b86822ff4976BfE136cB06CF43eC7FCF2574
+```
+
+For Solidity contracts:
+- Only provide the contract address (no `:path` suffix)
+- The debugger will show the contract address and function selectors
+- Source-level debugging is not available
+- Execution will continue after Solidity calls return
